@@ -3,8 +3,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
+import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { localCommitsOnUpstream } from '../src/client/ops.js';
+import { localCommitsOnUpstream, sync } from '../src/client/ops.js';
+import { Workspace } from '../src/client/workspace.js';
 
 const env = { ...process.env, GIT_AUTHOR_NAME: 'a', GIT_AUTHOR_EMAIL: 'a', GIT_COMMITTER_NAME: 'a', GIT_COMMITTER_EMAIL: 'a' };
 const git = (dir, ...args) => execFileSync('git', args, { cwd: dir, env, encoding: 'utf8' }).trim();
@@ -63,4 +66,51 @@ test('an up-to-date clone or one only behind main is simply not ahead', (t) => {
   commit(server, 'd.cpp', 'd\n');
   ws.git('fetch', '-q', 'origin');
   assert.equal(localCommitsOnUpstream(ws), true, 'behind is the ordinary fast-forward case');
+});
+
+test('sync verifies target bytes even for the same version in a dirty workspace', async (t) => {
+  const { clone } = setup(t);
+  const ws = new Workspace(clone);
+  const old = Buffer.from('old target');
+  const current = Buffer.from('new target');
+  const sha256 = createHash('sha256').update(current).digest('hex');
+  let downloads = 0;
+  let payload = current;
+  const version = { id: 'clean', sha256, size: current.length };
+  const server = http.createServer((req, res) => {
+    if (req.url === '/api/info') return res.end(JSON.stringify({ version }));
+    if (req.url === '/api/symbols?version=clean') return res.end(JSON.stringify({ version: 'clean', symbols: [] }));
+    if (req.url === '/target' && req.headers.authorization === 'Bearer contributor') {
+      downloads++;
+      return res.end(payload);
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  ws.config = { server: `http://127.0.0.1:${server.address().port}`, token: 'contributor' };
+  version.download = `${ws.config.server}/target`;
+  ws.save();
+  fs.writeFileSync(ws.targetFile, old);
+  fs.writeFileSync(ws.symbolsFile, JSON.stringify({ version: 'clean', symbols: [] }));
+  fs.writeFileSync(path.join(clone, 'a.cpp'), 'unfinished');
+
+  const result = await sync(ws);
+  assert.equal(result.fastForwarded, false);
+  assert.equal(fs.readFileSync(path.join(clone, 'a.cpp'), 'utf8'), 'unfinished');
+  assert.deepEqual(result.target, { version: 'clean', sha256, updated: true });
+  assert.deepEqual(fs.readFileSync(ws.targetFile), current);
+  assert.equal((await sync(ws)).target.updated, false);
+  assert.equal(downloads, 1, 'a verified target is not downloaded again');
+
+  fs.unlinkSync(ws.targetFile);
+  await sync(ws);
+  assert.deepEqual(fs.readFileSync(ws.targetFile), current);
+  fs.writeFileSync(ws.targetFile, old);
+  payload = Buffer.from('corrupt download');
+  await assert.rejects(sync(ws), /hash mismatch/);
+  assert.deepEqual(fs.readFileSync(ws.targetFile), old);
+  version.download = null;
+  await assert.rejects(sync(ws), new RegExp(sha256));
+  assert.deepEqual(fs.readFileSync(ws.targetFile), old);
 });

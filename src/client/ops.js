@@ -56,17 +56,15 @@ export async function setup({ server, dir, token, exe, runner, vc, sdk, image, t
     const got = sha256File(exe);
     if (got !== info.version.sha256) throw new Error(`${exe} is not the target of version ${info.version.id}: sha256 ${got}, expected ${info.version.sha256}`);
     fs.copyFileSync(exe, ws.targetFile);
-  } else if (!fs.existsSync(ws.targetFile) || sha256File(ws.targetFile) !== info.version.sha256) {
-    if (!info.version.download) throw new Error(`this project does not distribute the target; pass --exe <path to your copy> (sha256 ${info.version.sha256})`);
-    log(`downloading target ${info.version.id} (${(info.version.size / 1048576).toFixed(1)} MiB)`);
-    await authed.download(info.version.download, ws.targetFile, info.version.sha256);
+  } else {
+    await refreshTarget(ws, info.version, log);
   }
   log(`target verified: sha256 ${info.version.sha256}`);
 
   const lock = loadToolchainLock(abs)[info.toolchain] ?? {};
   ws.config.runners = { [info.toolchain]: runnerConfig({ runner, vc, sdk, image: image ?? (runner === 'docker' ? lock.image : undefined), toolchain, project: ws.project }) };
   ws.save();
-  await refreshSymbols(ws);
+  await refreshSymbols(ws, info.version.id);
   ws.config.envDigest = await computeEnvDigest(ws, info.toolchain);
   if (lock.clSha256 && ws.config.envDigest && ws.config.envDigest !== lock.clSha256) {
     log(`WARNING: your cl.exe (sha256 ${ws.config.envDigest}) is not the pinned one (${lock.clSha256}); results may differ from the server`);
@@ -122,11 +120,25 @@ async function computeEnvDigest(ws, toolchain) {
   return /^[0-9a-f]{64}/.exec(out.output)?.[0] ?? null;
 }
 
-export async function refreshSymbols(ws) {
+async function refreshTarget(ws, version, log) {
+  if (!version?.sha256) throw new Error('the server has no target checksum');
+  const updated = !fs.existsSync(ws.targetFile) || sha256File(ws.targetFile) !== version.sha256;
+  if (updated) {
+    if (!version.download) throw new Error(`this project does not distribute the target; provide ${ws.targetFile} for version ${version.id} (expected sha256 ${version.sha256})`);
+    log?.(`downloading target ${version.id} (${(version.size / 1048576).toFixed(1)} MiB)`);
+    await api(ws).download(version.download, ws.targetFile, version.sha256);
+  }
+  // Another process may already have replaced the file under a long-running MCP workspace.
+  ws._pe = null;
+  return updated;
+}
+
+export async function refreshSymbols(ws, version) {
   // The symbol table is large and changes in bursts; download it only when it changed.
   const etagFile = ws.symbolsFile + '.etag';
   const known = fs.existsSync(ws.symbolsFile) && fs.existsSync(etagFile) ? fs.readFileSync(etagFile, 'utf8') : null;
-  const r = await api(ws).getIfChanged('/api/symbols', known);
+  const url = version ? `/api/symbols?version=${encodeURIComponent(version)}` : '/api/symbols';
+  const r = await api(ws).getIfChanged(url, known);
   if (!r) return JSON.parse(fs.readFileSync(ws.symbolsFile, 'utf8'));
   fs.writeFileSync(ws.symbolsFile, JSON.stringify(r.data));
   if (r.etag) fs.writeFileSync(etagFile, r.etag);
@@ -165,7 +177,7 @@ export function writeEditorCompileDb(ws) {
 }
 
 /**
- * Fast-forwards the clone to the server's main and refreshes the symbol snapshot. Only a clean
+ * Fast-forwards the clone to the server's main and refreshes its target and symbols. Only a clean
  * working tree moves: in a shared checkout, uncommitted files may be someone's unfinished work.
  * When main was rewritten (same changes, new commit IDs), the clone's own commits no longer lie on
  * it and a fast-forward is impossible; if each of them is on main by content, nothing would be lost,
@@ -187,7 +199,9 @@ export async function sync(ws) {
       }
     }
   }
-  const snap = await refreshSymbols(ws);
+  const { version } = await api(ws).get('/api/info');
+  const updated = await refreshTarget(ws, version);
+  const snap = await refreshSymbols(ws, version.id);
   // A newer Ghidra project on the server is only announced (it is a large download).
   let ghidra = null;
   try {
@@ -198,7 +212,7 @@ export async function sync(ws) {
     ? `not fast-forwarded: ${changed.length} uncommitted files (${changed.slice(0, 5).join(', ')}); submit or set them aside first`
     : 'could not fast-forward (local commits or conflicting changes); merge origin/main yourself';
   writeEditorCompileDb(ws);
-  return { head: ws.head(), fastForwarded: pulled, ...(rewritten && { rewrittenMain: true }), symbols: snap.symbols.length, ghidra, note: pulled ? null : note };
+  return { head: ws.head(), fastForwarded: pulled, ...(rewritten && { rewrittenMain: true }), target: { version: version.id, sha256: version.sha256, updated }, symbols: snap.symbols.length, ghidra, note: pulled ? null : note };
 }
 
 /**

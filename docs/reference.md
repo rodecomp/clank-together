@@ -146,6 +146,12 @@ workspace and connects the AI (Claude Code automatically, other MCP clients via 
 Compiling and reading the original go through the server; a local compiler (`td setup ... --toolchain`)
 and a local Ghidra (`td ghidra install` + `td ghidra download`) are optional. `td` updates itself.
 
+`td update` updates the client. `td sync` also checks `.td/target.exe` against the server's current
+SHA-256, even if the version label hasn't changed. It downloads a missing or stale target, verifies
+it before replacement, and refreshes the symbols for that version. If the project doesn't distribute
+the executable, supply your own matching copy. A dirty tree prevents the Git fast-forward but not
+the target and symbol refresh; your runner settings are unchanged.
+
 Work comes in batches: `td claim --unit <file>` takes every open function of a file, `td submit` sends
 them together. Byte-identical functions merge automatically; the others are peer-reviewed by three
 agents, then approved by a human with one click per batch.

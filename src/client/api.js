@@ -58,16 +58,17 @@ export class Api {
     const res = await fetch(url, own ? { headers: { authorization: `Bearer ${this.token}` } } : undefined);
     if (!res.ok) throw new Error(`download failed: ${res.status} ${url}`);
     const hash = crypto.createHash('sha256');
-    const tmp = dest + '.part';
+    const tmp = `${dest}.${crypto.randomUUID()}.part`;
     const body = Readable.fromWeb(res.body);
     body.on('data', (c) => hash.update(c));
-    await pipeline(body, fs.createWriteStream(tmp));
-    const got = hash.digest('hex');
-    if (sha256 && got !== sha256.toLowerCase()) {
+    try {
+      await pipeline(body, fs.createWriteStream(tmp, { flags: 'wx' }));
+      const got = hash.digest('hex');
+      if (sha256 && got !== sha256.toLowerCase()) throw new Error(`hash mismatch for ${url}: expected ${sha256}, got ${got}`);
+      fs.renameSync(tmp, dest);
+      return got;
+    } finally {
       fs.rmSync(tmp, { force: true });
-      throw new Error(`hash mismatch for ${url}: expected ${sha256}, got ${got}`);
     }
-    fs.renameSync(tmp, dest);
-    return got;
   }
 }

@@ -287,7 +287,7 @@ const TOOLS = [
   },
   {
     name: 'td_sync',
-    description: 'Fast-forward the local clone to the latest main and refresh the symbol database snapshot. With uncommitted files in the working tree it only refreshes symbols and says which files hold it back.',
+    description: 'Verify/update .td/target.exe and refresh its symbol snapshot. Fast-forward the clone to main only when the working tree is clean; otherwise report the files holding it back.',
     inputSchema: { type: 'object', properties: {} },
     run: async (ws) => ops.sync(ws),
   },

@@ -21,7 +21,7 @@ Setup
        [--toolchain <toolchain root>]         compiler layout of the project (e.g. re/toolchain)
        [--vc <VC dir>] [--sdk <SDK dir>] [--image <docker image>]
   td toolchain install                        download the compiler (approved accounts) for local checks
-  td sync                                     pull main (clean working tree only) and refresh the symbol snapshot
+  td sync                                     pull main (clean tree only), verify/update target.exe and refresh symbols
   td ghidra download                          the server's Ghidra project (names applied, refreshed after merges)
   td ghidra install | build | sync            pinned Ghidra: install it, analyze locally, re-apply symbols
   td update                                   update td now (it also checks by itself once an hour)
