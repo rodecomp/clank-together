@@ -4,6 +4,8 @@
 import crypto from 'node:crypto';
 import { insnAt, normalizePath } from './listing.js';
 import { FUNCTION_KINDS, hex } from './annotations.js';
+import { reachOf } from './reach.js';
+import { selfcheckFunction } from './selfcheck.js';
 
 export const STATUS = {
   EXACT: 'exact', // every byte and every relocation target matches
@@ -158,7 +160,9 @@ export function bindAnnotations({ listing, file, annotations, nameIndex = new Ma
  * @param {Map<string, string>} p.nameIndex decorated name -> ID, learned from already-merged code
  * @param {import('./pe.js').PEImage} p.pe
  */
-export function compareObject({ obj, listing, file, annotations, symbols, nameIndex = new Map(), pe }) {
+// strict: also compare what each matching function reaches (reach.js).
+// selfcheck: {stride} also damages the original under each matching function (selfcheck.js).
+export function compareObject({ obj, listing, file, annotations, symbols, nameIndex = new Map(), pe, strict = false, symbolAt = () => null, selfcheck = null }) {
   const objFns = new Map(obj.functions().map((f) => [f.name, f]));
   const sizes = new Map([...objFns].map(([n, f]) => [n, f.bytes.length]));
   const found = bindAnnotations({ listing, file, annotations, nameIndex, symbols, sizes, locations: obj.functionLines() });
@@ -205,11 +209,22 @@ export function compareObject({ obj, listing, file, annotations, symbols, nameIn
       continue;
     }
     const proc = procsBySymbol.get(symbol);
-    const r = compareFunction({ fn: withLocalNames(fn), addr: sym.addr, origSize: sym.size, pe, resolve, symbols, proc, literalOf: (s) => obj.literal(s) });
+    // The function against an image: the original, or a damaged copy of it.
+    const judge = (image, trace = null) => {
+      const r = compareFunction({ fn: withLocalNames(fn), addr: sym.addr, origSize: sym.size, pe: image, resolve, symbols, proc, literalOf: (s) => obj.literal(s), trace });
+      const reach = strict && r.status !== STATUS.MISMATCH
+        ? reachOf({ obj, fn, addr: sym.addr, pe: image, resolve, qualify, symbols, symbolAt, trace })
+        : null;
+      return { r, reach };
+    };
+    const { r, reach } = judge(pe);
+    const damage = selfcheck && r.status !== STATUS.MISMATCH ? selfcheckFunction({ pe, addr: sym.addr, length: fn.bytes.length, judge, stride: selfcheck.stride }) : null;
     inferred.push(...r.inferred);
     delete r.inferred;
     const deletingDestructor = /^\?\?1/.test(symbol) && isDeletingDestructor(pe, sym.addr, sym.size);
-    functions.push({ ...base, addr: sym.addr, ...r, ...(deletingDestructor && { deletingDestructor: true }), asm: procText(proc) });
+    // Names without an ID that the reached pieces refer to are claims like the function's own.
+    if (reach?.pending) inferred.push(...reach.pending.map((p) => ({ symbol: p.symbol, addr: p.actual })));
+    functions.push({ ...base, addr: sym.addr, ...r, ...(reach && { reach }), ...(damage && { selfcheck: damage }), ...(deletingDestructor && { deletingDestructor: true }), asm: procText(proc) });
   }
 
   const boundSymbols = new Set([...bindings.keys(), ...byAnn.values()]);
@@ -286,6 +301,11 @@ export function compareLiteral(ours, addr, pe, name) {
   return { ok: false, reason: `constant differs: ours ${show(a)}, original ${show(full)}` };
 }
 
+/** Whether a constant is a __FILE__ value, which compareLiteral judges by its file name only. */
+function isSourcePath(bytes, name) {
+  return SOURCE_PATH_RE.test((name.startsWith('??_C@_1') ? bytes.toString('utf16le') : bytes.toString('latin1')).replace(/\0+$/, ''));
+}
+
 /**
  * What a constant is to the code that refers to it (effectiveHash): its bytes, or for a __FILE__
  * string its file name, as compareLiteral judges it (the directories are the build machine's).
@@ -297,7 +317,8 @@ function literalKey(bytes, name) {
 }
 
 /** Compares one compiled function with the original bytes at `addr`. */
-export function compareFunction({ fn, addr, origSize, pe, resolve, symbols, proc, literalOf }) {
+// trace: collects what the comparison leaves out on purpose and the constants it read (selfcheck.js).
+export function compareFunction({ fn, addr, origSize, pe, resolve, symbols, proc, literalOf, trace = null }) {
   const ours = fn.bytes;
   const compareLen = Math.max(ours.length, origSize || 0);
   const orig = pe.read(addr, compareLen);
@@ -336,7 +357,10 @@ export function compareFunction({ fn, addr, origSize, pe, resolve, symbols, proc
 
   for (const r of fn.relocs) {
     for (let k = 0; k < r.width && r.offset + k < compareLen; k++) masked[r.offset + k] = 1;
-    if (r.kind === 'other' || (r.kind === 'secrel' && tlsBase === null) || r.offset + r.width > compareLen) continue;
+    if (r.kind === 'other' || (r.kind === 'secrel' && tlsBase === null) || r.offset + r.width > compareLen) {
+      trace?.exempt.push({ start: r.offset, end: r.offset + r.width, why: 'relocation of a kind that is not judged' });
+      continue;
+    }
 
     const symName = r.symbol?.name ?? '?';
     const id = resolve(symName);
@@ -366,6 +390,7 @@ export function compareFunction({ fn, addr, origSize, pe, resolve, symbols, proc
     const literal = ok ? literalOf?.(r.symbol) : null;
     if (literal) {
       const res = compareLiteral(literal, actual, pe, symName);
+      trace?.literals.push({ addr: actual, len: literal.length, what: `constant ${symName}`, ...(isSourcePath(literal, symName) && { exempt: 'source path (__FILE__)' }) });
       relocResults.push({ offset: r.offset, symbol: symName, id: null, ok: res.ok, unresolved: false, actual, reason: res.reason, literal: true });
       // A constant has no address of its own: what the code reaches is its content.
       effective.push(`${r.offset}:${r.kind}:=${literalKey(literal, symName)}+${addend}`);
@@ -400,7 +425,7 @@ export function compareFunction({ fn, addr, origSize, pe, resolve, symbols, proc
   const sameLength = !origSize || origSize === ours.length;
   // Relocated fields only, before line numbers are masked against the original (effectiveHash).
   const relocMasked = Uint8Array.from(masked);
-  if (sameLength && proc) maskLineNumbers({ ours, orig, masked, proc });
+  if (sameLength && proc) maskLineNumbers({ ours, orig, masked, proc, trace });
 
   // Byte comparison outside relocated fields.
   const diffs = [];
@@ -452,7 +477,7 @@ export function compareFunction({ fn, addr, origSize, pe, resolve, symbols, proc
  * constant that merely equals its line number is code, and its score must not depend on where
  * the function sits in the file.
  */
-function maskLineNumbers({ ours, orig, masked, proc }) {
+function maskLineNumbers({ ours, orig, masked, proc, trace = null }) {
   const insns = proc.insns;
   for (let k = 0; k < insns.length; k++) {
     const insn = insns[k];
@@ -462,6 +487,7 @@ function maskLineNumbers({ ours, orig, masked, proc }) {
     for (let p = start + 1; p + 2 <= end; p++) {
       const width = p + 4 <= end && ours.readUInt32LE(p) === insn.srcLine ? 4 : ours.readUInt16LE(p) === insn.srcLine && p + 2 === end ? 2 : 0;
       if (!width) continue;
+      trace?.exempt.push({ start: p, end: p + width, why: 'line number (__LINE__)' });
       let differs = false;
       for (let i = p; i < p + width; i++) if (ours[i] !== orig[i]) differs = true;
       if (differs) for (let i = p; i < p + width; i++) masked[i] = 1;

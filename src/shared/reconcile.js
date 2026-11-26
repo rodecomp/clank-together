@@ -6,6 +6,7 @@
 
 import { STATUS, sameTarget } from './compare.js';
 import { hex } from './annotations.js';
+import { REACH, reachVerdict } from './reach.js';
 
 /**
  * @param {object} check                     result of checkUnits
@@ -78,6 +79,31 @@ export function reconcile(check, symbols, pe = null) {
       if (conflicted.some((s) => wrongSymbols.has(s))) f.status = STATUS.MISMATCH;
       else if (conflicted.length) f.conflictedReferences = conflicted;
       else if (allKnown) f.status = STATUS.EXACT;
+    }
+  }
+  // The strict check's verdict (reach.js) settles the same way: a reached name is decided once it
+  // stands for one known address, and a function whose own references are open is undecided too.
+  for (const u of check.units) {
+    for (const f of u.functions) {
+      if (!f.reach) continue;
+      if (f.status === STATUS.MISMATCH) {
+        delete f.reach;
+        continue;
+      }
+      const open = [];
+      for (const p of f.reach.pending ?? []) {
+        if (wrongSymbols.has(p.symbol)) {
+          f.reach.differs++;
+          f.reach.findings.unshift({ kind: 'differs', where: p.where, reason: `is known at another address than 0x${hex(p.actual)}` });
+        } else if (!(ok.has(p.symbol) && byAddr.has(p.actual)) || conflictSymbols.has(p.symbol)) open.push(p);
+      }
+      if (open.length) f.reach.pending = open;
+      else delete f.reach.pending;
+      f.reach.verdict = reachVerdict(f.reach);
+      // What is left open of the function's own references, the ones decided by content aside.
+      const decided = new Set(f.reach.decided ?? []);
+      const openOwn = f.status !== STATUS.EXACT && (f.relocations ?? []).some((r) => r.unresolved && !decided.has(r.symbol) && !(ok.has(r.symbol) && byAddr.has(r.actual)));
+      if (f.reach.verdict === REACH.VERIFIED && (openOwn || f.conflictedReferences)) f.reach.verdict = REACH.UNKNOWN;
     }
   }
   // Ambiguous names are not learned.

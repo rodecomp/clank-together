@@ -88,6 +88,7 @@ export class CoffObject {
 
     const symSize = this.bigobj ? 20 : 18;
     this.stringTableOffset = symPtr + numSymbols * symSize;
+    this.symbolTable = { offset: symPtr, entrySize: symSize };
 
     this.sections = [];
     for (let i = 0; i < numSections; i++) {
@@ -247,6 +248,16 @@ export class CoffObject {
     let end = sec.size;
     for (const s of this.symbols) if (s && s.section === symbol.section && s.value > symbol.value && s.value < end) end = s.value;
     return sec.data.subarray(symbol.value, end);
+  }
+
+  /**
+   * The symbol a weak external stands for when nothing else defines it (its auxiliary record's
+   * tag index), or null: `??_E` (vector deleting destructor) falls back to `??_G` this way.
+   */
+  weakDefault(symbol) {
+    if (!symbol || symbol.storageClass !== 105 || symbol.section !== 0 || !symbol.numAux) return null;
+    const aux = this.symbolTable.offset + (symbol.index + 1) * this.symbolTable.entrySize;
+    return this.symbols[this.buf.readUInt32LE(aux)] ?? null;
   }
 
   /** Data symbols (globals and statics) defined in this object. */
