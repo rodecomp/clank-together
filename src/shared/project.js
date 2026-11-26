@@ -44,6 +44,15 @@ export function loadProject(repoDir, readFile = (file) => readProjectFile(repoDi
     if (commands === null) throw new Error(`missing compile commands: ${cfg.compileCommands}`);
     project.compile = JSON.parse(commands);
   }
+  // Optional description of the original image: { image, sections, patches }. sections name what
+  // is not the linker's output (a protector's sections, resources, what a dumping tool rebuilt),
+  // patches: [{ addr, length, note }] bytes someone wrote over the linker's after the build.
+  if (cfg.targetManifest) {
+    const manifest = readFile(cfg.targetManifest);
+    if (manifest === null) throw new Error(`missing target manifest: ${cfg.targetManifest}`);
+    project.target = JSON.parse(manifest);
+    project.target.patches = (project.target.patches ?? []).map((p) => ({ ...p, addr: Number(p.addr) }));
+  }
   return project;
 }
 

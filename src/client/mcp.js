@@ -157,9 +157,10 @@ const TOOLS = [
       properties: {
         files: { type: 'array', items: { type: 'string' }, description: 'repo-relative files, checked over clean HEAD; default: all changed files in the working tree' },
         includers: { type: 'boolean', description: 'also compile every unit including a changed header' },
+        strict: { type: 'boolean', description: 'also compare what each matching function reaches (tables, vtables, exception handlers): verified, code-exact or unknown' },
       },
     },
-    run: async (ws, a) => ops.check(ws, a.files, { includers: !!a.includers }),
+    run: async (ws, a) => ops.check(ws, a.files, { includers: !!a.includers, strict: !!a.strict }),
   },
   {
     name: 'td_check_result',

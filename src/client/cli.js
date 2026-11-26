@@ -33,8 +33,12 @@ Work (a region: a source file, a class, or a run of unplaced functions, done as 
   td region claim <file> | --class <Name> | --range 0xA-0xB   claim a region (several agents may share one)
   td region release <file> | --class <Name> | --range 0xA-0xB give a region back
   td place <taskId>=<file.cpp>[:Class::Method] ...  put held functions that are in no source file into one
-  td check [files...] [--includers]           compile + compare on this machine; named files over a clean HEAD
-                                              (--includers: every unit that includes a changed header)
+  td check [files...] [--includers] [--strict]  compile + compare on this machine; named files over a clean HEAD
+                                              (--includers: every unit that includes a changed header;
+                                              --strict: also compare what each matching function reaches:
+                                              tables, vtables, exception handlers. verified / code-exact / unknown;
+                                              --selfcheck [--every N]: damage each byte (each N-th) of the original
+                                              a matching result rests on, and list the damage it does not notice)
   td compile [--out DIR] [--jobs N] [--link-only]   build the whole program on this machine with the
                                               project's exeBuild command (data/decomp.json); incremental
   td submit [--notes T]                       submit the region's work as one batch
@@ -92,11 +96,26 @@ function printCheck(r) {
       if (f.deletingDestructor) console.log(`      ${f.id} is a scalar deleting destructor in the original: remove this annotation and claim it no-decompile (compiler_generated)`);
       for (const d of f.diffRegions ?? []) console.log(`      +0x${d.offset.toString(16)}: ours ${d.ours} orig ${d.original}  ${d.ourInstruction ?? ''}${d.sourceLine ? ` (line ${d.sourceLine})` : ''}`);
       for (const x of f.relocations ?? []) console.log(`      reloc +0x${x.offset.toString(16)} ${x.symbol}: ${x.ok ? `not yet named, original points at 0x${hex(x.actual)}` : x.reason}`);
+      if (f.reach) {
+        console.log(`      strict: ${f.reach.verdict}${f.reach.pieces ? ` (${f.reach.pieces} reached piece(s), ${f.reach.bytes} bytes)` : ''}`);
+        for (const w of f.reach.findings) console.log(`        ${w.kind === 'differs' ? 'differs' : 'undecided'}: ${w.where}: ${w.reason}`);
+        for (const p of f.reach.pending ?? []) console.log(`        not yet named: ${p.where}, original points at 0x${hex(p.actual)}`);
+      }
+      for (const s of f.selfcheck?.survived ?? []) console.log(`      selfcheck: damage at 0x${hex(s.addr)} not noticed (${s.what})`);
     }
     for (const f of u.folded ?? []) console.log(`  FOLDED ${f.id} (line ${f.line})${''.padEnd(22)} ${f.status.padEnd(17)} ${(f.score * 100).toFixed(1)}%  size ${f.size?.ours ?? '-'}/${f.size?.original ?? '?'}`);
     if (u.unannotated.length) console.log(`  unannotated: ${u.unannotated.join(', ')}`);
   }
   for (const c of r.referenceConflicts) console.log(`conflict: ${c.message ?? c}`);
+  const damaged = r.units.flatMap((u) => u.functions).filter((f) => f.selfcheck);
+  if (damaged.length) {
+    const sum = (pick) => damaged.reduce((n, f) => n + pick(f.selfcheck), 0);
+    const exempt = {};
+    for (const f of damaged) for (const [why, n] of Object.entries(f.selfcheck.exempt)) exempt[why] = (exempt[why] ?? 0) + n;
+    const survived = sum((s) => s.survived.length + (s.moreSurvived ?? 0));
+    console.log(`\nselfcheck: ${damaged.length} matching function(s) rest on ${sum((s) => s.bytes)} bytes of the original; ${sum((s) => s.tried)} damaged one at a time, ${survived} not noticed`);
+    for (const [why, n] of Object.entries(exempt)) console.log(`  exempt: ${n} bytes, ${why}`);
+  }
 }
 
 function printImprovable(r, json) {
@@ -203,6 +222,9 @@ async function main() {
       json: { type: 'boolean', default: false },
       free: { type: 'boolean', default: false },
       includers: { type: 'boolean', default: false },
+      strict: { type: 'boolean', default: false },
+      selfcheck: { type: 'boolean', default: false },
+      every: { type: 'string' },
       prefix: { type: 'string' },
       class: { type: 'string' },
       force: { type: 'boolean', default: false },
@@ -315,7 +337,7 @@ connect your AI with:  td connect --workspace "${ws.dir}"`);
       return print(r);
     }
     case 'check': {
-      const r = await ops.check(ws, args.map((f) => ops.relPath(ws, f)), { includers: values.includers });
+      const r = await ops.check(ws, args.map((f) => ops.relPath(ws, f)), { includers: values.includers, strict: values.strict, selfcheck: values.selfcheck ? { stride: Math.max(1, Number(values.every) || 1) } : null });
       return values.json ? print(r) : printCheck(r);
     }
     case 'compile': {
